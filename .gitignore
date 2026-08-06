@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 个人存档数据（含个人信息，不提交）
+*.xml
+*.xml.bak
+*_decrypted.json
+
+# 测试文件
+_test_*
+_*.py
