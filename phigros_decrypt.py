@@ -1,506 +1,512 @@
 # -*- coding: utf-8 -*-
 """
-Phigros 本地存档解密器
-=====================
-解密 Unity PlayerPrefs 存档 (com.PigeonGames.Phigros.v2.playerprefs.xml)
-
-算法：自定义 AES 变体（CBC 模式）
-  - 硬编码 sBox / invSBox / initialVector / rcon / tempArray
-  - 15 轮：初始轮 + 13 主轮 + 最终轮
-  - invSBox 兼作 round key 数组（切片 [224:240], [208:16], [0:16]）
-  - MixColumns 用 rcon 查表（非标准 GF(2^8)）
-  - ShiftRows 用 tempArray 置换
-
-参考：https://github.com/yt6983138/PhigrosLibraryCSharp (LocalSave.cs, MIT)
-
-流程：
-  XML <string name="key">value</string>
-  -> URL decode (得到 base64)
-  -> base64 decode (得到密文字节)
-  -> 自定义 AES-CBC 解密
-  -> 去 PKCS7 padding
-  -> UTF-8 明文 (key 如 "MARENOL.LeaF.0.Record.HD"，value 如 JSON)
+Phigros Save Editor
 """
-import re
 import sys
 import json
-import base64
-import urllib.parse
-import xml.etree.ElementTree as ET
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
-
-# ============================================================
-# 从 LocalSave_reference.cs 提取硬编码表
-# ============================================================
-def extract_byte_array(cs_src, name):
-    """从 C# 源码提取 byte[] 字面量（允许 = 与 [ 之间有注释/换行）"""
-    pattern = rf'byte\[\]\s+{name}\s*=[^[]*\[(.*?)\]\s*;'
-    m = re.search(pattern, cs_src, re.DOTALL)
-    if not m:
-        raise ValueError(f"未找到表: {name}")
-    nums = re.findall(r'\d+', m.group(1))
-    return bytes(int(x) for x in nums)
+# Import decryption/encryption module from the same directory
+sys.path.insert(0, str(Path(__file__).parent))
+from phigros_decrypt import (
+    load_tables, PhigrosCipher, process_save, save_to_xml,
+)
 
 
-def load_tables(cs_path):
-    """从 C# 源码加载所有加密表"""
-    src = Path(cs_path).read_text(encoding="utf-8")
-    tables = {
-        "sBox": extract_byte_array(src, "sBox"),
-        "invSBox": extract_byte_array(src, "invSBox"),
-        "initialVector": extract_byte_array(src, "initialVector"),
-        "rcon": extract_byte_array(src, "rcon"),
-        "tempArray": extract_byte_array(src, "tempArray"),
-    }
-    return tables
+def find_cs_path():
+    here = Path(__file__).parent
+    candidates = [
+        here / "LocalSave_reference.cs",
+        here.parent / "LocalSave_reference.cs",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return here / "LocalSave_reference.cs"
 
 
-# ============================================================
-# 自定义 AES 块变换（严格按 LocalSave.cs 实现）
-# ============================================================
-class PhigrosCipher:
-    def __init__(self, tables):
-        self.sBox = tables["sBox"]
-        self.invSBox = tables["invSBox"]
-        self.iv = tables["initialVector"]
-        self.rcon = tables["rcon"]
-        self.tempArray = tables["tempArray"]
+class PhigrosEditor:
+    def __init__(self, root):
+        self.root = root
+        root.title("Phigros Save Editor by FuwaMintNEKO (Batch Edit Enabled)")
+        root.geometry("1100x720")
+        root.minsize(900, 560)
 
-        # 预计算 sBox 的真正逆（注意：源码 invSBox 是 round key 数组，并非 sBox 的逆）
-        self.inv_sBox_true = [0] * 256
-        for i, v in enumerate(self.sBox):
-            self.inv_sBox_true[v] = i
-        # 预计算 tempArray 的逆置换：inv_tempArray[tempArray[i]] = i
-        self.inv_tempArray = [0] * 16
-        for i, v in enumerate(self.tempArray):
-            self.inv_tempArray[v] = i
+        # Data
+        self.cipher = None
+        self.entries = []
+        self.current_xml_path = None
+        self.tree_to_index = {}
+        self.current_selections = []  # List of currently selected entries indices
 
-    def _sub_bytes(self, block):
-        return bytes(self.sBox[b] for b in block)
+        # Initialize cipher first
+        try:
+            cs_path = find_cs_path()
+            tables = load_tables(cs_path)
+            self.cipher = PhigrosCipher(tables)
+        except Exception as e:
+            messagebox.showerror(
+                "Failed to Load Encryption Tables",
+                f"Cannot load LocalSave_reference.cs:\n{e}\n\n"
+                "Please ensure this file is in the same directory as this program."
+            )
+            root.after(100, root.destroy)
+            return
 
-    def _shift_rows(self, block):
-        # new[i] = old[tempArray[i]]
-        return bytes(block[self.tempArray[i]] for i in range(16))
+        # Build UI
+        self._build_ui()
+        self._update_status("Ready. Please click [Open Save] to select a playerprefs.xml file.")
 
-    def _add_round_key(self, block, round_key):
-        return bytes(block[i] ^ round_key[i] for i in range(16))
+    # ---------------- UI Construction ----------------
+    def _build_ui(self):
+        # Top toolbar
+        top = ttk.Frame(self.root, padding=(8, 6))
+        top.pack(side=tk.TOP, fill=tk.X)
 
-    def _mix_columns(self, block):
-        s = bytearray(block)
-        rcon = self.rcon
-        for n in range(0, 16, 4):
-            i0, i1, i2, i3 = s[n], s[n+1], s[n+2], s[n+3]
-            sBoxColumnSum = i0 ^ i1 ^ i2 ^ i3
-            rconColumnSum = rcon[sBoxColumnSum]
-            doubleRconColumnSumI0I2 = rcon[rcon[rconColumnSum ^ i0 ^ i2]] ^ sBoxColumnSum
-            doubleRconColumnSumI1I3 = rcon[rcon[rconColumnSum ^ i1 ^ i3]] ^ sBoxColumnSum
-            s[n+0] ^= doubleRconColumnSumI0I2 ^ rcon[i0 ^ i1]
-            s[n+1] ^= doubleRconColumnSumI1I3 ^ rcon[i1 ^ i2]
-            s[n+2] ^= doubleRconColumnSumI0I2 ^ rcon[i2 ^ i3]
-            s[n+3] ^= doubleRconColumnSumI1I3 ^ rcon[i3 ^ i0]
-        return bytes(s)
+        ttk.Button(top, text="Open Save", command=self.open_file).pack(side=tk.LEFT)
+        ttk.Button(top, text="Save (Encrypt & Write)", command=self.save_file).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(top, text="Save As…", command=self.save_as_file).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(top, text="Reload", command=self.reload_file).pack(side=tk.LEFT, padx=(6, 0))
 
-    # ---------- 加密用的逆变换 ----------
-    # 注：源码中的 invSBox 实际是 round key 数组（共 240 字节），不是 sBox 的逆。
-    # 真正的 sBox 逆需要自行构建：inv_sBox_true[sBox[i]] = i。
-    # tempArray 的逆置换：inv_tempArray[tempArray[i]] = i。
-    # MixColumns 矩阵经推导为 [[14,11,13,9],[9,14,11,13],[13,9,14,11],[11,13,9,14]]，
-    # 即标准 AES 的 InvMixColumns；其逆为标准 AES 的 MixColumns [[2,3,1,1],...]。
-    def _inv_sub_bytes(self, block):
-        return bytes(self.inv_sBox_true[b] for b in block)
+        self.file_label = ttk.Label(top, text="(No file opened)", foreground="#666")
+        self.file_label.pack(side=tk.LEFT, padx=(14, 0))
 
-    def _inv_shift_rows(self, block):
-        # shift_rows: new[i] = old[tempArray[i]]  =>  old[tempArray[i]] = new[i]
-        # 即 old[j] = new[inv_tempArray[j]]，对位置 j 取 inv_tempArray[j]
-        return bytes(block[self.inv_tempArray[i]] for i in range(16))
+        # Search bar
+        search_frame = ttk.Frame(self.root, padding=(8, 4))
+        search_frame.pack(side=tk.TOP, fill=tk.X)
 
-    @staticmethod
-    def _gmul(a, b):
-        """GF(2^8) 乘法，模 0x11b（标准 AES）"""
-        p = 0
-        for _ in range(8):
-            if b & 1:
-                p ^= a
-            hi = a & 0x80
-            a = (a << 1) & 0xFF
-            if hi:
-                a ^= 0x1b
-            b >>= 1
-        return p
+        ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT)
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", self._on_search_change)
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
+        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
 
-    def _inv_mix_columns(self, block):
-        s = bytearray(block)
-        g = self._gmul
-        for n in range(0, 16, 4):
-            i0, i1, i2, i3 = s[n], s[n+1], s[n+2], s[n+3]
-            s[n+0] = g(i0, 2) ^ g(i1, 3) ^ i2        ^ i3
-            s[n+1] = i0        ^ g(i1, 2) ^ g(i2, 3) ^ i3
-            s[n+2] = i0        ^ i1        ^ g(i2, 2) ^ g(i3, 3)
-            s[n+3] = g(i0, 3) ^ i1        ^ i2        ^ g(i3, 2)
-        return bytes(s)
+        ttk.Label(search_frame, text="Scope:").pack(side=tk.LEFT)
+        self.search_scope = ttk.Combobox(
+            search_frame, state="readonly", width=10,
+            values=["All", "Key", "Value"],
+        )
+        self.search_scope.set("All")
+        self.search_scope.bind("<<ComboboxSelected>>", lambda e: self._on_search_change())
+        self.search_scope.pack(side=tk.LEFT)
 
-    def decrypt(self, ciphertext):
-        """
-        解密密文字节，返回明文 UTF-8 字符串。
-        CBC 模式：每块解密后 XOR 前一块密文（首块 XOR IV）。
-        """
-        if len(ciphertext) % 16 != 0:
-            raise ValueError(f"密文长度 {len(ciphertext)} 不是 16 的倍数")
-        invSBox = self.invSBox
-        data = bytearray(ciphertext)
-        state = bytearray(self.iv)  # CBC 链，初始为 IV
+        ttk.Button(search_frame, text="Select All Shown", command=self.select_all_shown).pack(side=tk.LEFT, padx=(8, 0))
 
-        for e in range(0, len(data), 16):
-            block = bytes(data[e:e+16])
-            # 初始轮
-            block = self._add_round_key(block, invSBox[224:240])
-            block = self._shift_rows(block)
-            block = self._sub_bytes(block)
-            # 主轮：i = 208, 192, ..., 16
-            for i in range(208, 15, -16):
-                block = self._add_round_key(block, invSBox[i:i+16])
-                block = self._mix_columns(block)
-                block = self._shift_rows(block)
-                block = self._sub_bytes(block)
-            # 最终轮
-            block = self._add_round_key(block, invSBox[0:16])
-            # CBC：XOR 前一块密文
-            block = bytes(block[j] ^ state[j] for j in range(16))
-            # 更新 state 为当前块的原始密文
-            state = bytearray(data[e:e+16])
-            # 写回明文
-            data[e:e+16] = block
+        self.match_count_label = ttk.Label(search_frame, text="", foreground="#666")
+        self.match_count_label.pack(side=tk.LEFT, padx=(10, 0))
 
-        # PKCS7 去填充
-        pad = data[-1]
-        if pad < 1 or pad > 16:
-            # padding 异常，可能解密失败；返回原数据
-            return bytes(data)
-        return bytes(data[:-pad])
+        # Middle list (Treeview) - selectmode="extended" allows Shift/Ctrl multi-select
+        list_frame = ttk.Frame(self.root)
+        list_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
 
-    def encrypt(self, plaintext):
-        """
-        加密明文字节，返回密文字节。CBC 模式 + PKCS7 填充。
-        流程为 decrypt 的严格逆操作：
-          1) PKCS7 填充到 16 倍数
-          2) 每块：先 XOR 前一块密文（CBC），再做 decrypt 块变换的逆
-             逆序：add_round_key(invSBox[0:16]) -> [inv_sub, inv_shift, inv_mix, add_round_key] x13
-                   -> inv_sub, inv_shift, add_round_key(invSBox[224:240])
-        """
-        # PKCS7 填充（即便明文恰为 16 倍数也补一整块 16）
-        pad = 16 - (len(plaintext) % 16)
-        plaintext = bytes(plaintext) + bytes([pad]) * pad
+        columns = ("idx", "key", "value", "type", "status")
+        self.tree = ttk.Treeview(
+            list_frame, columns=columns, show="headings", selectmode="extended"
+        )
+        self.tree.heading("idx", text="#")
+        self.tree.heading("key", text="Key")
+        self.tree.heading("value", text="Value")
+        self.tree.heading("type", text="Type")
+        self.tree.heading("status", text="Status")
+        self.tree.column("idx", width=50, stretch=False, anchor="e")
+        self.tree.column("key", width=320, stretch=True)
+        self.tree.column("value", width=420, stretch=True)
+        self.tree.column("type", width=60, stretch=False, anchor="center")
+        self.tree.column("status", width=70, stretch=False, anchor="center")
 
-        invSBox = self.invSBox
-        out = bytearray()
-        state = bytearray(self.iv)  # CBC 链，初始为 IV
+        # Scrollbars
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(list_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
-        for e in range(0, len(plaintext), 16):
-            block = bytes(plaintext[e:e+16])
-            # CBC：先 XOR 前一块密文
-            block = bytes(block[j] ^ state[j] for j in range(16))
-            # 反向最终轮
-            block = self._add_round_key(block, invSBox[0:16])
-            # 反向主轮：i = 16, 32, ..., 208
-            for i in range(16, 209, 16):
-                block = self._inv_sub_bytes(block)
-                block = self._inv_shift_rows(block)
-                block = self._inv_mix_columns(block)
-                block = self._add_round_key(block, invSBox[i:i+16])
-            # 反向初始轮
-            block = self._inv_sub_bytes(block)
-            block = self._inv_shift_rows(block)
-            block = self._add_round_key(block, invSBox[224:240])
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
 
-            out.extend(block)
-            state = bytearray(block)  # CBC 链更新为当前密文
+        # Highlight modified entries with yellow background
+        self.tree.tag_configure("modified", background="#fff3b0")
+        self.tree.tag_configure("plain", foreground="#888")
+        self.tree.tag_configure("error", foreground="#c0392b")
 
-        return bytes(out)
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+        self.tree.bind("<Control-a>", lambda e: self.select_all_shown())
+        self.tree.bind("<Control-A>", lambda e: self.select_all_shown())
 
+        # Bottom edit area
+        edit_frame = ttk.LabelFrame(self.root, text="Edit Selected Entry's Value (Supports Multi-Select)", padding=(8, 6))
+        edit_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
+        edit_frame.columnconfigure(1, weight=1)
 
-# ============================================================
-# XML 存档解析与解密
-# ============================================================
-def decrypt_string(cipher, url_encoded_str):
-    """
-    解密单个存档字符串：
-    URL-encoded base64 -> base64 decode -> AES 解密 -> UTF-8
-    """
-    b64 = urllib.parse.unquote(url_encoded_str)
-    try:
-        ciphertext = base64.b64decode(b64)
-    except Exception as e:
-        return None, f"base64 解码失败: {e}"
-    if len(ciphertext) == 0 or len(ciphertext) % 16 != 0:
-        # 非加密条目（如 unity 自带的明文 key）
-        return None, "非 16 字节倍数，疑似明文"
-    try:
-        plaintext = cipher.decrypt(ciphertext)
-        return plaintext, None
-    except Exception as e:
-        return None, f"解密失败: {e}"
+        ttk.Label(edit_frame, text="Key:").grid(row=0, column=0, sticky="nw", pady=(0, 4))
+        self.key_display = tk.Text(edit_frame, height=2, wrap="word",
+                                   state="disabled", background="#f4f4f4")
+        self.key_display.grid(row=0, column=1, sticky="ew", pady=(0, 4))
 
+        ttk.Label(edit_frame, text="Value:").grid(row=1, column=0, sticky="nw")
+        self.value_edit = tk.Text(edit_frame, height=6, wrap="none")
+        self.value_edit.grid(row=1, column=1, sticky="ew")
+        val_vsb = ttk.Scrollbar(edit_frame, orient="vertical", command=self.value_edit.yview)
+        val_vsb.grid(row=1, column=2, sticky="ns")
+        self.value_edit.configure(yscrollcommand=val_vsb.set)
 
-def process_save(xml_path, cipher, output_path=None, verbose=False):
-    """解析 XML，解密所有 key/value。
+        btn_row = ttk.Frame(edit_frame)
+        btn_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Button(btn_row, text="Apply Changes to List", command=self.apply_edit).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Discard Changes (Restore Original)", command=self.discard_edit).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btn_row, text="Format JSON", command=self.format_json).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btn_row, text="Minify JSON", command=self.compress_json).pack(side=tk.LEFT, padx=(6, 0))
+        self.edit_hint = ttk.Label(btn_row, text="", foreground="#666")
+        self.edit_hint.pack(side=tk.LEFT, padx=(14, 0))
 
-    条目分类：
-      - string + encrypted=True : 加密字符串（key/value 均为 URL-encoded base64 密文）
-      - string + encrypted=False: 明文字符串（如 unity.player_session_count，值不加密）
-      - int / float / ...        : 数值类型，值在 value 属性中，明文可编辑
-    """
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
+        # Bottom status bar
+        status_frame = ttk.Frame(self.root, padding=(8, 4))
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_var = tk.StringVar()
+        ttk.Label(status_frame, textvariable=self.status_var, foreground="#333").pack(side=tk.LEFT)
+        self.modified_count_var = tk.StringVar(value="Modified: 0")
+        ttk.Label(status_frame, textvariable=self.modified_count_var, foreground="#c0392b").pack(side=tk.RIGHT)
 
-    entries = []
-    for elem in root:
-        tag = elem.tag
-        name = elem.get("name", "")
-        text = (elem.text or "").strip()
+    # ---------------- Toolbar Actions ----------------
+    def open_file(self):
+        path = filedialog.askopenfilename(
+            title="Select Phigros Save File",
+            filetypes=[("XML Files", "*.xml"), ("All Files", "*.*")],
+            initialdir=str(Path.home()),
+        )
+        if not path:
+            return
+        self._load_file(path)
 
-        if tag == "string":
-            # 尝试解密 key 和 value
-            key_plain, key_err = decrypt_string(cipher, name)
-            val_plain, val_err = decrypt_string(cipher, text)
+    def reload_file(self):
+        if self.current_xml_path:
+            self._load_file(self.current_xml_path)
 
-            if key_plain is not None and val_plain is not None:
-                # 加密条目：key/value 均成功解密
-                key_str = key_plain.decode("utf-8", errors="replace")
-                val_str = val_plain.decode("utf-8", errors="replace")
-                entry = {
-                    "type": "string",
-                    "encrypted": True,
-                    "raw_key": name,
-                    "raw_value": text,
-                    "key": key_str,
-                    "value": val_str,
-                    "original_value": val_str,
-                    "key_error": None,
-                    "value_error": None,
-                }
-            else:
-                # 明文条目：key 或 value 无法解密（如 unity.player_session_count=1）
-                # 直接使用原始文本作为 key 和 value
-                entry = {
-                    "type": "string",
-                    "encrypted": False,
-                    "raw_key": name,
-                    "raw_value": text,
-                    "key": name,
-                    "value": text,
-                    "original_value": text,
-                    "key_error": None,
-                    "value_error": None,
-                }
+    def _load_file(self, path):
+        try:
+            entries = process_save(path, self.cipher)
+        except Exception as e:
+            messagebox.showerror("Decryption Failed", f"Failed to read or decrypt file:\n{e}")
+            return
+        self.entries = entries
+        self.current_xml_path = path
+        self.file_label.config(text=str(path))
+        self._populate_tree(entries)
+        total = len(entries)
+        enc = sum(1 for e in entries if e["type"] == "string" and e.get("encrypted"))
+        plain_str = sum(1 for e in entries if e["type"] == "string" and not e.get("encrypted"))
+        non_str = sum(1 for e in entries if e["type"] != "string")
+        self._update_status(f"Loaded {total} entries; Encrypted: {enc}; Plaintext: {plain_str}; Non-string: {non_str}.")
+        self._update_modified_count()
+
+    def save_file(self):
+        if not self.current_xml_path:
+            messagebox.showwarning("Not Saved", "Please open a save file first.")
+            return
+        self._do_save(self.current_xml_path)
+
+    def save_as_file(self):
+        if not self.entries:
+            messagebox.showwarning("Not Saved", "Please open a save file first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save As",
+            defaultextension=".xml",
+            filetypes=[("XML Files", "*.xml"), ("All Files", "*.*")],
+            initialfile="playerprefs_new.xml",
+        )
+        if not path:
+            return
+        try:
+            import shutil
+            shutil.copy2(self.current_xml_path, path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to copy original file:\n{e}")
+            return
+        self._do_save(path, backup=False)
+
+    def _do_save(self, path, backup=True):
+        modified = sum(1 for e in self.entries
+                       if not e.get("value_error")
+                       and e["value"] != e.get("original_value"))
+        if modified == 0:
+            if not messagebox.askyesno("Notice", "No entries were modified. Write back to file anyway?"):
+                return
+        try:
+            n = save_to_xml(path, self.cipher, self.entries, backup=backup)
+        except Exception as e:
+            messagebox.showerror("Save Failed", f"Encryption or write-back failed:\n{e}")
+            return
+        for e in self.entries:
+            e["original_value"] = e["value"]
+        self._populate_tree(self._current_filter_entries())
+        bak_msg = f"; Backup: {path}.bak" if backup else ""
+        self._update_status(f"Saved to {path}; Updated {n} entries{bak_msg}.")
+        self._update_modified_count()
+        messagebox.showinfo("Save Successful", f"Updated {n} entries and wrote to:\n{path}")
+
+    # ---------------- List Population & Search ----------------
+    def _populate_tree(self, entries_subset=None):
+        self.tree.delete(*self.tree.get_children())
+        self.tree_to_index.clear()
+        if entries_subset is None:
+            for i, e in enumerate(self.entries):
+                self._insert_entry(i, e)
         else:
-            # int / float 等类型：值在 value 属性中
-            val_attr = elem.get("value", "")
-            entry = {
-                "type": tag,
-                "encrypted": False,
-                "raw_key": name,
-                "raw_value": val_attr,
-                "key": name,
-                "value": val_attr,
-                "original_value": val_attr,
-                "key_error": None,
-                "value_error": None,
-            }
-        entries.append(entry)
+            subset_ids = {id(e) for e in entries_subset}
+            for i, e in enumerate(self.entries):
+                if id(e) in subset_ids:
+                    self._insert_entry(i, e)
 
-    return entries
-
-
-def encrypt_string(cipher, plaintext_str):
-    """加密单个字符串：UTF-8 -> AES 加密 -> base64 -> URL encode
-    返回与原存档格式一致的可写入 <string> 文本（URL-encoded base64）。
-    """
-    plaintext = plaintext_str.encode("utf-8")
-    ciphertext = cipher.encrypt(plaintext)
-    b64 = base64.b64encode(ciphertext).decode("ascii")
-    # safe="" 把 / + = 都转义，与原存档一致
-    return urllib.parse.quote(b64, safe="")
-
-
-def save_to_xml(xml_path, cipher, entries, backup=True):
-    """根据 entries 重新加密并写回 XML。
-
-    修改逻辑（按 raw_key 精确匹配，避免误改共享同一密文的其他条目）：
-      - 加密 string (encrypted=True)：重新加密 value，写入 <string> 文本
-      - 明文 string (encrypted=False)：直接写入 <string> 文本（不加密）
-      - int / float 等：写入 value 属性
-
-    backup=True 时先备份原文件到 .bak（若 .bak 已存在则不覆盖）。
-    返回被修改的条目数。
-    """
-    import shutil
-
-    xml_path = Path(xml_path)
-    if backup:
-        bak = xml_path.with_suffix(xml_path.suffix + ".bak")
-        if not bak.exists():
-            shutil.copy2(xml_path, bak)
-
-    # 重新解析原 XML 以保留顺序与未修改条目
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-
-    # 建立 raw_key -> (kind, new_value) 的映射（仅修改过的条目）
-    #   kind="text": 设置 elem.text（string 类型）
-    #   kind="attr": 设置 value 属性（int/float 等类型）
-    # 同一新明文只加密一次（加密结果确定，可复用）
-    updates = {}
-    encrypt_cache = {}   # plaintext -> url_encoded_base64
-    modified_count = 0
-    for e in entries:
-        if e["value"] == e.get("original_value"):
-            continue
-        raw_key = e["raw_key"]
-
-        if e["type"] == "string" and e.get("encrypted", True):
-            # 加密字符串：重新加密
-            new_val = e["value"]
-            if new_val not in encrypt_cache:
-                try:
-                    encrypt_cache[new_val] = encrypt_string(cipher, new_val)
-                except Exception as ex:
-                    raise RuntimeError(
-                        f"加密失败 (key={e.get('key') or raw_key[:30]}): {ex}"
-                    )
-            updates[raw_key] = ("text", encrypt_cache[new_val])
-        elif e["type"] == "string":
-            # 明文字符串：直接写入
-            updates[raw_key] = ("text", e["value"])
+    def _entry_status_and_tags(self, e):
+        modified = (not e.get("value_error")
+                    and e["value"] != e.get("original_value"))
+        if e.get("value_error"):
+            status = "Error"
+        elif modified:
+            status = "Modified"
+        elif e["type"] != "string":
+            status = e["type"]
+        elif not e.get("encrypted", True):
+            status = "Plaintext"
         else:
-            # int / float 等：更新 value 属性
-            updates[raw_key] = ("attr", e["value"])
-        modified_count += 1
+            status = "—"
 
-    # 应用更新：按 name 属性精确匹配
-    for elem in root:
-        name = elem.get("name", "")
-        if name in updates:
-            kind, new_val = updates[name]
-            if kind == "text":
-                elem.text = new_val
+        tags = []
+        if modified:
+            tags.append("modified")
+        if e["type"] != "string" or not e.get("encrypted", True):
+            tags.append("plain")
+        if e.get("value_error"):
+            tags.append("error")
+        return status, tags
+
+    def _insert_entry(self, idx, e):
+        key_text = e.get("key") or f"[Undecrypted] {e['raw_key'][:40]}"
+        val_text = e.get("value")
+        if val_text is None:
+            val_text = f"[Error] {e.get('value_error') or ''}"
+        key_disp = key_text if len(key_text) <= 200 else key_text[:200] + "…"
+        val_disp = val_text if len(val_text) <= 500 else val_text[:500] + "…"
+
+        status, tags = self._entry_status_and_tags(e)
+
+        item = self.tree.insert(
+            "", "end",
+            values=(idx + 1, key_disp, val_disp, e["type"], status),
+            tags=tags,
+        )
+        self.tree_to_index[item] = idx
+
+    def _current_filter_entries(self):
+        q = self.search_var.get().strip().lower()
+        scope = self.search_scope.get()
+        if not q:
+            return list(self.entries)
+        result = []
+        for e in self.entries:
+            k = (e.get("key") or "").lower()
+            v = (e.get("value") or "").lower()
+            if scope == "Key":
+                if q in k:
+                    result.append(e)
+            elif scope == "Value":
+                if q in v:
+                    result.append(e)
             else:
-                elem.set("value", new_val)
+                if q in k or q in v:
+                    result.append(e)
+        return result
 
-    # 写回（保持 UTF-8 + XML 声明，与原文件一致）
-    tree.write(xml_path, encoding="utf-8", xml_declaration=True)
-    return modified_count
+    def _on_search_change(self, *args):
+        self._populate_tree(self._current_filter_entries())
+        n = len(self.tree.get_children())
+        self.match_count_label.config(text=f"Matched: {n}")
+
+    def select_all_shown(self):
+        children = self.tree.get_children()
+        if children:
+            self.tree.selection_set(children)
+        return "break"
+
+    # ---------------- Selection & Editing ----------------
+    def _on_tree_select(self, event):
+        sel = self.tree.selection()
+        if not sel:
+            self.current_selections = []
+            return
+        indices = [self.tree_to_index[item] for item in sel if item in self.tree_to_index]
+        if not indices:
+            self.current_selections = []
+            return
+        self.current_selections = indices
+
+        if len(indices) == 1:
+            idx = indices[0]
+            e = self.entries[idx]
+
+            # Display Key
+            self.key_display.config(state="normal")
+            self.key_display.delete("1.0", "end")
+            key_text = e.get("key") or f"[Undecrypted] {e['raw_key']}"
+            self.key_display.insert("1.0", key_text)
+            self.key_display.config(state="disabled")
+
+            # Display Value
+            self.value_edit.delete("1.0", "end")
+            val = e.get("value")
+            if val is None:
+                val = f"[Error] {e.get('value_error') or ''}"
+            self.value_edit.insert("1.0", val)
+
+            # Hints
+            if e.get("value_error"):
+                self.edit_hint.config(text=f"Cannot decrypt this entry: {e['value_error']}, not editable.")
+            elif e["type"] == "string" and not e.get("encrypted", True):
+                self.edit_hint.config(text="Plaintext string, Value is editable. Click [Apply Changes to List] when done.")
+            elif e["type"] != "string":
+                self.edit_hint.config(text=f"{e['type']} type, Value is editable. Click [Apply Changes to List] when done.")
+            else:
+                self.edit_hint.config(text="Value is editable. Click [Apply Changes to List] when done.")
+        else:
+            # Multiple items selected
+            first_e = self.entries[indices[0]]
+            self.key_display.config(state="normal")
+            self.key_display.delete("1.0", "end")
+            sample_keys = ", ".join((self.entries[i].get("key") or "")[:30] for i in indices[:3])
+            more = "..." if len(indices) > 3 else ""
+            self.key_display.insert("1.0", f"[{len(indices)} entries selected] ({sample_keys}{more})")
+            self.key_display.config(state="disabled")
+
+            # Show first item's value if all share the same value, or just show the first one as template
+            self.value_edit.delete("1.0", "end")
+            val = first_e.get("value") or ""
+            self.value_edit.insert("1.0", val)
+
+            self.edit_hint.config(
+                text=f"Batch Mode: {len(indices)} entries selected. Editing Value and clicking [Apply] will update ALL selected entries!"
+            )
+
+    def _on_tree_double_click(self, event):
+        if not self.current_selections:
+            return
+        self.format_json()
+
+    def apply_edit(self):
+        if not self.current_selections:
+            messagebox.showinfo("Notice", "Please select at least one record from the list first.")
+            return
+
+        new_val = self.value_edit.get("1.0", "end-1c")
+
+        # Validate if any selected item is int
+        has_int = any(self.entries[idx]["type"] == "int" for idx in self.current_selections)
+        if has_int:
+            try:
+                int(new_val.strip())
+            except ValueError:
+                if not messagebox.askyesno(
+                    "Type Warning",
+                    f"One or more selected entries are of type 'int', but the input \"{new_val.strip()}\" is not a valid integer.\nApply anyway?"
+                ):
+                    return
+
+        updated = 0
+        skipped = 0
+        for idx in self.current_selections:
+            e = self.entries[idx]
+            if e.get("value_error"):
+                skipped += 1
+                continue
+            e["value"] = new_val
+            self._update_tree_row(idx)
+            updated += 1
+
+        self._update_modified_count()
+        skip_msg = f" ({skipped} undecryptable skipped)" if skipped else ""
+        self.edit_hint.config(text=f"Applied to {updated} entries{skip_msg}. Click [Save] to write back to file.")
+
+    def discard_edit(self):
+        if not self.current_selections:
+            return
+        for idx in self.current_selections:
+            e = self.entries[idx]
+            e["value"] = e.get("original_value")
+            self._update_tree_row(idx)
+
+        first_e = self.entries[self.current_selections[0]]
+        self.value_edit.delete("1.0", "end")
+        self.value_edit.insert("1.0", first_e["value"] or "")
+        self._update_modified_count()
+        self.edit_hint.config(text=f"Restored {len(self.current_selections)} selected entries to original value.")
+
+    def format_json(self):
+        if not self.current_selections:
+            return
+        cur = self.value_edit.get("1.0", "end-1c").strip()
+        if not cur:
+            return
+        try:
+            obj = json.loads(cur)
+            pretty = json.dumps(obj, ensure_ascii=False, indent=2)
+            self.value_edit.delete("1.0", "end")
+            self.value_edit.insert("1.0", pretty)
+            self.edit_hint.config(text="JSON formatted (not yet applied, click [Apply Changes to List]).")
+        except json.JSONDecodeError as ex:
+            self.edit_hint.config(text=f"Invalid JSON: {ex}")
+
+    def compress_json(self):
+        if not self.current_selections:
+            return
+        cur = self.value_edit.get("1.0", "end-1c").strip()
+        if not cur:
+            return
+        try:
+            obj = json.loads(cur)
+            compact = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+            self.value_edit.delete("1.0", "end")
+            self.value_edit.insert("1.0", compact)
+            self.edit_hint.config(text="JSON minified (not yet applied, click [Apply Changes to List]).")
+        except json.JSONDecodeError as ex:
+            self.edit_hint.config(text=f"Invalid JSON: {ex}")
+
+    def _update_tree_row(self, idx):
+        for item, i in self.tree_to_index.items():
+            if i == idx:
+                e = self.entries[idx]
+                key_text = e.get("key") or f"[Undecrypted] {e['raw_key'][:40]}"
+                val_text = e.get("value") or ""
+                key_disp = key_text if len(key_text) <= 200 else key_text[:200] + "…"
+                val_disp = val_text if len(val_text) <= 500 else val_text[:500] + "…"
+                status, tags = self._entry_status_and_tags(e)
+                self.tree.item(item, values=(idx + 1, key_disp, val_disp, e["type"], status), tags=tags)
+                break
+
+    # ---------------- Status Bar ----------------
+    def _update_status(self, msg):
+        self.status_var.set(msg)
+
+    def _update_modified_count(self):
+        n = sum(1 for e in self.entries
+                if not e.get("value_error")
+                and e["value"] != e.get("original_value"))
+        self.modified_count_var.set(f"Modified: {n}")
 
 
-# ============================================================
-# 主程序
-# ============================================================
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(
-        description="Phigros 本地存档解密器",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""\
-示例：
-  python phigros_decrypt.py com.PigeonGames.Phigros.v2.playerprefs.xml
-  python phigros_decrypt.py 存档.xml -o 明文.json
-  python phigros_decrypt.py 存档.xml -v   # 显示详细解密过程
-""",
-    )
-    parser.add_argument("xml", help="Phigros playerprefs XML 文件路径")
-    parser.add_argument("-o", "--output", help="输出 JSON 文件路径（默认 输出_decrypted.json）")
-    parser.add_argument("-v", "--verbose", action="store_true", help="显示详细过程")
-    parser.add_argument("--cs", default="LocalSave_reference.cs",
-                        help="LocalSave.cs 源码路径（用于提取加密表）")
-    args = parser.parse_args()
-
-    xml_path = Path(args.xml)
-    if not xml_path.exists():
-        print(f"[错误] 文件不存在: {xml_path}", file=sys.stderr)
-        sys.exit(1)
-
-    cs_path = Path(args.cs)
-    if not cs_path.exists():
-        print(f"[错误] 缺少加密表源码: {cs_path}", file=sys.stderr)
-        print("请确保 LocalSave_reference.cs 在同目录", file=sys.stderr)
-        sys.exit(1)
-
-    # 加载表
-    print("[1/3] 加载加密表...")
-    tables = load_tables(cs_path)
-    for name, data in tables.items():
-        print(f"  {name}: {len(data)} 字节")
-
-    cipher = PhigrosCipher(tables)
-
-    # 解析并解密
-    print(f"\n[2/3] 解密存档: {xml_path.name}")
-    entries = process_save(str(xml_path), cipher, verbose=args.verbose)
-
-    # 统计
-    total = len(entries)
-    enc_str = sum(1 for e in entries if e["type"] == "string" and e.get("encrypted"))
-    plain_str = sum(1 for e in entries if e["type"] == "string" and not e.get("encrypted"))
-    non_string = sum(1 for e in entries if e["type"] != "string")
-
-    print(f"  共 {total} 条")
-    print(f"  加密 string 条目: {enc_str}")
-    print(f"  明文 string 条目: {plain_str}")
-    print(f"  非 string 条目: {non_string}")
-
-    # 输出
-    print(f"\n[3/3] 输出结果...")
-    output = Path(args.output) if args.output else xml_path.with_name(
-        xml_path.stem + "_decrypted.json"
-    )
-
-    # 构造可读输出
-    result = {
-        "source": str(xml_path.name),
-        "total": total,
-        "entries": [],
-    }
-    for e in entries:
-        result["entries"].append({
-            "key": e["key"],
-            "value": e["value"],
-            "type": e["type"],
-            "encrypted": e.get("encrypted", False),
-            "raw_key": e["raw_key"][:80],
-            "key_error": e["key_error"],
-            "value_error": e["value_error"],
-        })
-
-    output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"  已保存: {output}")
-
-    # 控制台预览前若干条
-    print(f"\n{'='*70}")
-    print("预览（前 30 条成功解密的条目）：")
-    print(f"{'='*70}")
-    shown = 0
-    for e in entries:
-        if shown >= 30:
-            break
-        if e["key"] and e["value"]:
-            k = e["key"]
-            v = e["value"]
-            if len(v) > 100:
-                v = v[:100] + "..."
-            print(f"\n  KEY:   {k}")
-            print(f"  VALUE: {v}")
-            shown += 1
-
-    if args.verbose:
-        print(f"\n{'='*70}")
-        print("全部条目（含失败）：")
-        print(f"{'='*70}")
-        for i, e in enumerate(entries):
-            k = e["key"] or f"[未解密: {e['key_error']}]"
-            v = e["value"] or f"[未解密: {e['value_error']}]"
-            print(f"  [{i+1}] {e['type']}")
-            print(f"      key:   {k}")
-            print(f"      value: {v}")
+    root = tk.Tk()
+    try:
+        style = ttk.Style()
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+    except Exception:
+        pass
+    app = PhigrosEditor(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
