@@ -1,5 +1,6 @@
 # Phigros Save Editor by FuwaMintNEKO 
-(Yeah this tool is completely written by FuwaMintNEKO and i only translated this from Chinese to English using AI bc idk how to read Chinese TvT & added some features such as multiselect key & batch value editing for convenience use)
+(Yeah this tool is completely written by FuwaMintNEKO and i only translated this from Chinese to English using AI bc idk how to read Chinese TvT & added some features such as multiselect key & batch value editing for convenience uses)
+(thank you so much for creating this amazing tool FuwaMintNEKO / 非常感谢你制作了这款超棒的工具，FuwaMintNEKO (┬┬﹏┬┬))
 
 A graphical tool for viewing and editing local Phigros save files (`playerprefs.xml`).
 
@@ -19,7 +20,7 @@ A graphical tool for viewing and editing local Phigros save files (`playerprefs.
 |------|------|
 | `phigros_editor.py` | Graphical editor (main program) (the only thing I translated) |
 | `phigros_decrypt.py` | Decryption/encryption library + command-line tool |
-| `analyze_phigros.py` | Archive analysis script (read-only, used for debugging the encryption format) |
+| `analyze_phigros.py` | Save file analysis script (read-only, used for debugging the encryption format) |
 | `LocalSave_reference.cs` | Encryption table source code (sBox / invSBox / IV / rcon / tempArray) |
 
 ## Usage
@@ -32,6 +33,7 @@ python phigros_editor.py
 ```
 Then click Enter, after that you have to click on Open Save button on top left corner -> find your Phigros save file and open it -> Edit the way you want -> click on "Apply Changes to List" after done editing -> click on "Save (Encrypt & Write)" to save your save file 
 
+With phigros_decrypt.py, you can use it to decrypt your original save file into readable text by typing "python phigros_decrypt.py putsavefilenamehere.xml -v"
 ## 依赖 (Dependencies)
 
 - Python 3.8+
@@ -50,13 +52,3 @@ The encryption algorithms are based on [PhigrosLibraryCSharp](https://github.com
 (Using this tool to modify save files may result in data corruption or account risks; you assume all responsibility for the consequences)
 - 如有侵权，请联系删除
 (If you believe your rights have been infringed, please contact us to have the content removed)
-
-## Disclaimer
-
-This project is intended solely for educational and exchange purposes and is not intended for any commercial use.
-
-- The copyright for the Phigros game belongs to [PigeonGames](https://pigeongames.cn/)
-- The encryption algorithms are based on [PhigrosLibraryCSharp](https://github.com/yt6983138/PhigrosLibraryCSharp) (MIT License)
-- Using this tool to modify save files may result in data corruption or account risks; you assume all responsibility for the consequences
-- If you believe your rights have been infringed, please contact us to have the content removed
-
